@@ -1,13 +1,98 @@
 import { Track, TrackProcessor, ProcessorOptions } from 'livekit-client'
-import { NoiseSuppressorWorklet_Name } from '@timephy/rnnoise-wasm'
-
-// This is an example how to get the script path using Vite, may be different when using other build tools
-// NOTE: `?worker&url` is important (`worker` to generate a working script, `url` to get its url to load it)
-import NoiseSuppressorWorklet from '@timephy/rnnoise-wasm/NoiseSuppressorWorklet?worker&url'
 
 // Use Jitsi's approach: maintain a global AudioContext variable
 // and suspend/resume it as needed to manage audio state
 let audioContext: AudioContext
+
+// load wasm files and worklet
+const loadedFiles: {
+  error: string | undefined;
+  wasmBlob: ArrayBuffer | undefined;
+  wasmJS: string | undefined;
+  worklet: BlobPart;
+} = {
+  // store first caught error
+  error: undefined,
+  // BBBA-mapi.wasm
+  wasmBlob: undefined,
+  // BBBA-mapi.js
+  wasmJS: undefined,
+  // mapi-proc.js
+  worklet: '',
+};
+
+const loadFiles = () => {
+  return new Promise<void>((success, reject) => {
+    // return early if already loaded before
+    if (typeof loadedFiles.error !== 'undefined') {
+      reject(loadedFiles.error);
+      return;
+    }
+    if (loadedFiles.wasmBlob && loadedFiles.wasmJS && loadedFiles.worklet) {
+      success();
+      return;
+    }
+
+    if (typeof AudioContext === 'undefined') {
+      loadedFiles.error = 'AudioContext unsupported';
+      reject(loadedFiles.error);
+      return;
+    }
+    if (typeof WebAssembly === 'undefined') {
+      loadedFiles.error = 'WebAssembly unsupported';
+      reject(loadedFiles.error);
+      return;
+    }
+    // eslint-disable-next-line max-len
+    if (!WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 2, 8, 1, 1, 97, 1, 98, 3, 127, 1, 6, 6, 1, 127, 1, 65, 0, 11, 7, 5, 1, 1, 97, 3, 1]))) {
+      loadedFiles.error = 'Importable/Exportable mutable globals unsupported';
+      reject(loadedFiles.error);
+      return;
+    }
+
+    // check if SIMD is supported, needed for old Safari versions
+    const supportsSIMD = WebAssembly.validate(
+      // eslint-disable-next-line max-len
+      new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]),
+    );
+
+    const catchHandler = (error: string) => {
+      // only reject Promise once
+      if (!loadedFiles.error) {
+        loadedFiles.error = error;
+        reject(loadedFiles.error);
+      }
+    };
+
+    const checkResolved = () => {
+      if (loadedFiles.wasmBlob && loadedFiles.wasmJS && loadedFiles.worklet) {
+        success();
+      }
+    };
+
+    // load wasm files and worklet
+    const basepath = '/wasm/';
+    const suffix = supportsSIMD ? '' : '-nosimd';
+    fetch(`${basepath}BBBA${suffix}-mapi.wasm`).then((resp) => {
+      resp.arrayBuffer().then((bytes) => {
+        loadedFiles.wasmBlob = bytes;
+        checkResolved();
+      }).catch(catchHandler);
+    }).catch(catchHandler);
+    fetch(`${basepath}BBBA${suffix}-mapi.js`).then((resp) => {
+      resp.text().then((text) => {
+        loadedFiles.wasmJS = text;
+        checkResolved();
+      }).catch(catchHandler);
+    }).catch(catchHandler);
+    fetch(`${basepath}mapi-proc.js`).then((resp) => {
+      resp.text().then((text) => {
+        loadedFiles.worklet = text;
+        checkResolved();
+      }).catch(catchHandler);
+    }).catch(catchHandler);
+  });
+};
 
 export interface AudioProcessorInterface
   extends TrackProcessor<Track.Kind.Audio> {
@@ -36,17 +121,34 @@ export class RnnNoiseProcessor implements AudioProcessorInterface {
       await audioContext.resume()
     }
 
-    await audioContext.audioWorklet.addModule(NoiseSuppressorWorklet)
+    await loadFiles();
+
+    const processorBlob = new Blob([loadedFiles.worklet], { type: 'text/javascript' });
+    const processorURL = URL.createObjectURL(processorBlob);
+
+    await audioContext.audioWorklet.addModule(processorURL)
 
     this.sourceNode = audioContext.createMediaStreamSource(
       new MediaStream([this.source])
     )
 
+
     this.noiseSuppressionNode = new AudioWorkletNode(
       audioContext,
-      NoiseSuppressorWorklet_Name
+      'mapi-proc'
     )
-
+    const nn = this.noiseSuppressionNode;
+    this.noiseSuppressionNode.port.onmessage = (event) => {
+      if (event.data?.type === 'loaded') {
+        nn.port.postMessage({ type: 'param', symbol: "intensity", value: 90 });
+        nn.port.postMessage({ type: 'param', symbol: "leveler_target", value: -18 });
+        nn.port.postMessage({ type: 'param', symbol: "sb_strength", value: 60 });
+        nn.port.postMessage({ type: 'param', symbol: "mb_strength", value: 60 });
+        nn.port.postMessage({ type: 'param', symbol: "pre_gain", value: 2 });
+        nn.port.postMessage({ type: 'param', symbol: "post_gain", value: 0 });
+      }
+    };
+    this.noiseSuppressionNode.port.postMessage({ type: 'init', wasm: loadedFiles.wasmBlob, js: loadedFiles.wasmJS });
     this.destinationNode = audioContext.createMediaStreamDestination()
 
     // Connect the audio processing chain
