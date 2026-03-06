@@ -6,10 +6,10 @@ let audioContext: AudioContext
 
 // load wasm files and worklet
 const loadedFiles: {
-  error: string | undefined;
-  wasmBlob: BufferSource | undefined;
-  wasmJS: string | undefined;
-  worklet: BlobPart;
+  error?: string;
+  wasmBlob?: BufferSource;
+  wasmJS?: string;
+  worklet?: BlobPart;
 } = {
   // store first caught error
   error: undefined,
@@ -18,7 +18,7 @@ const loadedFiles: {
   // BBBA-mapi.js
   wasmJS: undefined,
   // mapi-proc.js
-  worklet: '',
+  worklet: undefined,
 };
 
 const loadFiles = () => {
@@ -94,10 +94,27 @@ const loadFiles = () => {
   });
 };
 
-export interface CompatScriptProcessorNode
-  extends ScriptProcessorNode {
-  port: object
-}
+// compat interface that mimics MessagePort
+export interface CompatMessagePort {
+  onmessage: (event: any) => void;
+  postMessage: (data: any) => void;
+};
+
+// compat interface to extend old ScriptProcessorNode with a MessagePort-like object
+export interface CompatScriptProcessorNode extends ScriptProcessorNode {
+  port?: CompatMessagePort
+};
+
+export interface MAPIModule extends WebAssembly.Module {
+  _malloc: (size: number) => number;
+  _mapi_process: (handle: number, inputPtr: number, outputPtr: number, numFrames: number) => void;
+  _mapi_set_parameter: (handle: number, symbol: number, value: number) => void;
+  _mapi_create: (sampleRate: number, bufferSize: number) => number;
+  lengthBytesUTF8: (str: string) => number;
+  stringToUTF8: (str: string, buffer: number, bufferSize: number) => void;
+  HEAPF32: any;
+  HEAPU32: any;
+};
 
 // create audio worklet or script processor
 // we rely on script processor because worklets must run at 128 block size, which is not possible on low-spec machines
@@ -105,24 +122,28 @@ const createScriptProcessor = () => {
   return new Promise<CompatScriptProcessorNode>((success, reject) => {
     // execute JS to expose the emscripten load module function
     const jsfn_bbba = new Function(loadedFiles.wasmJS + 'return mapi_bbba;');
-    const create_module_bbba = jsfn_bbba.call();
+    const create_module_bbba = jsfn_bbba.call(undefined);
 
     // audio setup
     const bufferSize = 4096;
     const numberOfInputs = 1;
     const numberOfOutputs = 1;
-    const processor: ScriptProcessorNode | CompatScriptProcessorNode = audioContext.createScriptProcessor(bufferSize, numberOfInputs, numberOfOutputs);
+    const processor: CompatScriptProcessorNode = audioContext.createScriptProcessor(bufferSize, numberOfInputs, numberOfOutputs);
+    processor.port = {
+      onmessage: () => {},
+      postMessage: () => {},
+    };
 
     create_module_bbba({
-      instantiateWasm: (imports: object, successCallback: Function<void>) => {
-        WebAssembly.instantiate(loadedFiles.wasmBlob, imports)
+      instantiateWasm: (imports: WebAssembly.Imports, successCallback: Function) => {
+        WebAssembly.instantiate(loadedFiles.wasmBlob!, imports)
         .then(output => {
           successCallback(output.instance, output.module);
         })
         .catch(reject);
         return {};
       },
-      postRun: function(module: Module) {
+      postRun: (module: MAPIModule) => {
         const handle = module._mapi_create(audioContext.sampleRate, bufferSize);
 
         const audioData = module._malloc(module.HEAPF32.BYTES_PER_ELEMENT * bufferSize);
@@ -157,24 +178,21 @@ const createScriptProcessor = () => {
         };
 
         // use same API as worklet for pushing changes
-        processor.port = {
-          onmessage: () => {},
-          postMessage: (data: any) => {
-            switch (data.type)
-            {
-            case 'init':
-              processor.port.onmessage({ type: 'loaded' });
-              break;
-            case 'enable':
-              enabled = !!data.enable;
-              break;
-            case 'param':
-              module._mapi_set_parameter(handle, csymbol(data.symbol), data.value);
-              break;
-            case 'destroy':
-              break;
-            }
-          },
+        processor.port!.postMessage = (data: any) => {
+          switch (data.type)
+          {
+          case 'init':
+            processor.port!.onmessage({ data: { type: 'loaded' }});
+            break;
+          case 'enable':
+            enabled = !!data.enable;
+            break;
+          case 'param':
+            module._mapi_set_parameter(handle, csymbol(data.symbol), data.value);
+            break;
+          case 'destroy':
+            break;
+          }
         };
 
         success(processor);
@@ -195,7 +213,7 @@ export class RnnNoiseProcessor implements AudioProcessorInterface {
   private source?: MediaStreamTrack
   private sourceNode?: MediaStreamAudioSourceNode
   private destinationNode?: MediaStreamAudioDestinationNode
-  private noiseSuppressionNode?: AudioWorkletNode
+  private noiseSuppressionNode?: AudioWorkletNode | CompatScriptProcessorNode
 
   async init(opts: ProcessorOptions<Track.Kind.Audio>) {
     if (!opts.track) {
@@ -221,7 +239,7 @@ export class RnnNoiseProcessor implements AudioProcessorInterface {
     // which is not possible on low-spec machines
     if (! navigator.userAgent.match(/Android/i)) {
       // Using Audio Worklet
-      const processorBlob = new Blob([loadedFiles.worklet], { type: 'text/javascript' });
+      const processorBlob = new Blob([loadedFiles.worklet!], { type: 'text/javascript' });
       const processorURL = URL.createObjectURL(processorBlob);
 
       await audioContext.audioWorklet.addModule(processorURL)
@@ -232,21 +250,21 @@ export class RnnNoiseProcessor implements AudioProcessorInterface {
       )
     } else {
       // fallback with createScriptProcessor follows here
-      this.noiseSuppressionNode = createScriptProcessor();
+      this.noiseSuppressionNode = await createScriptProcessor();
     }
 
     const nn = this.noiseSuppressionNode;
-    nn.port.onmessage = (event) => {
+    nn.port!.onmessage = (event: MessageEvent) => {
       if (event.data?.type === 'loaded') {
-        nn.port.postMessage({ type: 'param', symbol: "intensity", value: 90 });
-        nn.port.postMessage({ type: 'param', symbol: "leveler_target", value: -18 });
-        nn.port.postMessage({ type: 'param', symbol: "sb_strength", value: 60 });
-        nn.port.postMessage({ type: 'param', symbol: "mb_strength", value: 60 });
-        nn.port.postMessage({ type: 'param', symbol: "pre_gain", value: 2 });
-        nn.port.postMessage({ type: 'param', symbol: "post_gain", value: 0 });
+        nn.port!.postMessage({ type: 'param', symbol: "intensity", value: 90 });
+        nn.port!.postMessage({ type: 'param', symbol: "leveler_target", value: -18 });
+        nn.port!.postMessage({ type: 'param', symbol: "sb_strength", value: 60 });
+        nn.port!.postMessage({ type: 'param', symbol: "mb_strength", value: 60 });
+        nn.port!.postMessage({ type: 'param', symbol: "pre_gain", value: 2 });
+        nn.port!.postMessage({ type: 'param', symbol: "post_gain", value: 0 });
       }
     };
-    nn.port.postMessage({ type: 'init', wasm: loadedFiles.wasmBlob, js: loadedFiles.wasmJS });
+    nn.port!.postMessage({ type: 'init', wasm: loadedFiles.wasmBlob, js: loadedFiles.wasmJS });
 
     this.destinationNode = audioContext.createMediaStreamDestination()
 
